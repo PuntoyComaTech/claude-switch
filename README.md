@@ -1,103 +1,136 @@
 # claude-switch
 
-Use several Claude subscriptions (Pro / Max) with Claude Code on macOS, and switch to the next one automatically when the current one hits its limit.
+Use several Claude subscriptions (Pro / Max) in Claude Code on macOS. When one reaches its usage limit, every session moves to the next one on its own, without logging in again and without restarting.
 
-- **One command to switch.** `claude-switch use work` and every Claude Code session, including ones already running, moves to that account. No browser login each time.
-- **Automatic.** Your status line already receives your 5h and weekly usage from Claude Code. claude-switch reads it and moves to the next account at 95%.
-- **No extra traffic.** It never calls Anthropic's APIs or refreshes tokens itself. Usage comes from the status line JSON, and Claude Code refreshes tokens as usual.
-- **Small.** One bash script. Needs `jq` (ships with macOS 15+).
+```
+* trabajo    me@company.com    5h 96%  resets Mon 18:00   7d 40%
+  personal   me@gmail.com      5h 12%                     7d 8%
+```
 
-## How it works
-
-Claude Code keeps its login in the macOS Keychain (`Claude Code-credentials`) and the signed-in account in `~/.claude.json` (`oauthAccount`). claude-switch saves a copy of both per account in the Keychain (service `claude-switch`) and swaps them in place:
-
-1. Saves the live login of the active account first, because Claude Code rotates its tokens.
-2. Writes the target login into the Keychain item. MCP logins in the same item are kept.
-3. Writes the target `oauthAccount` into `~/.claude.json` atomically.
-4. Touches `~/.claude/.credentials.json`, which makes running sessions re-read the Keychain.
-
-`report` runs from your status line on every update. It records the active account's usage and calls `next` when the 5h or weekly window reaches the threshold. Right after a switch a session still shows the old account's numbers until its next response, so repeated numbers from the same session are ignored.
+- **Automatic.** Claude Code already sends your 5-hour and weekly usage to the status line. claude-switch reads it there and switches at 95%.
+- **No extra traffic.** It never calls Anthropic APIs and never refreshes tokens itself. Claude Code keeps doing that.
+- **Adding an account does not touch your sessions.** The browser login for a new account happens in an isolated config, so running sessions stay where they are.
+- **One bash script.** Needs `jq`, which ships with recent macOS.
 
 ## Install
 
 ```sh
-git clone https://github.com/PuntoyComaTech/claude-switch.git
-cd claude-switch
-./install.sh            # symlinks bin/claude-switch into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/PuntoyComaTech/claude-switch/main/install.sh | bash
 ```
 
-Save each account once:
+This puts `claude-switch` in `~/.local/bin` and hooks it into your Claude Code status line:
+
+- **No status line yet:** it installs one that shows account, model and usage.
+- **You already have one:** it prints one line to paste into your script. It never edits your script.
+
+Prefer a clone, so `git pull` updates it?
 
 ```sh
-claude-switch add personal          # the account you are logged in with now
-claude-switch add work --login      # log in to another one in the browser
+git clone https://github.com/PuntoyComaTech/claude-switch.git
+cd claude-switch && ./install.sh
+```
+
+## Set up your accounts
+
+```sh
+claude-switch add personal          # the account Claude Code is logged in with now
+claude-switch add trabajo --login   # opens the browser; pick the other account
 claude-switch list
 ```
 
-`add --login` runs `claude auth login` inside a throwaway config dir. Claude Code keeps a separate Keychain item per config dir, so your current login and every running session stay on the account they are using. The new account is just added to the list. If a Claude Code version ever writes the main item anyway, claude-switch puts the original back.
+Repeat `add <name> --login` for each extra subscription. Names are any single word.
 
-The first Keychain access may show a macOS prompt for `security`. Choose **Always Allow**.
+On first use macOS may ask whether `security` can access the Keychain. Choose **Always Allow**.
 
-### Automatic switching
+That is all. Use Claude Code as usual. When the active account reaches the threshold, the next response triggers the switch and the status line shows the new account.
 
-Add this to your status line script, after it reads stdin into `$input`:
+## Everyday commands
+
+| Command | What it does |
+|---|---|
+| `claude-switch list` | Accounts, last known usage, which one is active, which need a login |
+| `claude-switch use <name>` | Switch now. Running sessions follow on their next request |
+| `claude-switch next` | Switch to the next account that is not at its limit |
+| `claude-switch add <name>` | Save the account you are logged in with |
+| `claude-switch add <name> --login` | Log in to another account and save it, without switching |
+| `claude-switch login <name>` | Log in again to a saved account whose login expired |
+| `claude-switch rename <old> <new>` | Rename an account |
+| `claude-switch remove <name>` | Forget an account |
+| `claude-switch current` | Print the active account name |
+
+### Settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CLAUDE_SWITCH_THRESHOLD` | `95` | Usage % (5h or weekly) that triggers a switch |
+| `CLAUDE_SWITCH_DIR` | `~/.claude-switch` | State, log and installed status line |
+
+The threshold is read where `report` runs, so set it in your status line script:
+
+```sh
+printf '%s' "$input" | CLAUDE_SWITCH_THRESHOLD=96 claude-switch report
+```
+
+Logs: `~/.claude-switch/log`.
+
+## Using your own status line
+
+Add this line after your script reads stdin into `$input`:
 
 ```sh
 command -v claude-switch >/dev/null && { printf '%s' "$input" | claude-switch report >/dev/null 2>&1 & }
 ```
 
-Optional: show the active account in the status line with `$(claude-switch current)`.
+To show the active account, add `$(claude-switch current)` to your output. [statusline-example.sh](statusline-example.sh) is a complete example.
 
-No status line yet? See [statusline-example.sh](statusline-example.sh) and add to `~/.claude/settings.json`:
+## How it works
 
-```json
-"statusLine": { "type": "command", "command": "bash /path/to/statusline-example.sh" }
-```
+Claude Code keeps its login in the macOS Keychain (item `Claude Code-credentials`) and the signed-in account in `~/.claude.json` (`oauthAccount`). claude-switch keeps a copy of both for each account in its own Keychain items (service `claude-switch`). To switch it:
 
-## Commands
+1. Saves the current login first, because Claude Code rotates its tokens.
+2. Writes the target login into Claude Code's Keychain item. MCP logins stored in the same item are kept.
+3. Writes the target `oauthAccount` into `~/.claude.json` atomically.
+4. Touches `~/.claude/.credentials.json` so running sessions re-read the Keychain.
 
-| Command | What it does |
-|---|---|
-| `add <name>` | Save the account you are logged in with |
-| `add <name> --login` | Log in to another account and save it, without switching |
-| `use <name>` | Switch to a saved account |
-| `next` | Switch to the next account that is not at its limit |
-| `login <name>` | Log in again to a saved account, without switching |
-| `list` | Accounts, last known usage, and which need a login |
-| `current` | Print the active account |
-| `rename <old> <new>` | Rename a saved account |
-| `remove <name>` | Delete a saved account |
-| `report` | Read status line JSON on stdin, switch when over the limit |
+`report` runs from the status line after each response. It records the active account's usage and calls `next` when either window reaches the threshold. Right after a switch, a session keeps showing the old account's numbers until its next response. Repeated numbers from the same session are therefore ignored.
 
-Settings: `CLAUDE_SWITCH_THRESHOLD` (default `95`), `CLAUDE_SWITCH_DIR` (default `~/.claude-switch`). Logs go to `~/.claude-switch/log`.
+`add --login` runs `claude auth login` with `CLAUDE_CONFIG_DIR` pointing at a temporary folder. Claude Code stores that login in a separate Keychain item. claude-switch copies it and deletes the temporary item and folder. If a Claude Code version wrote the main item anyway, claude-switch restores the original.
 
 ## Expired logins
 
-If an account goes unused long enough for its refresh token to expire, claude-switch sees it from the saved expiry date, with no request:
+claude-switch checks the saved refresh-token expiry date locally, with no request:
 
-- `use` / `next` from a terminal run `claude auth login --email <that account>`. You only confirm in the browser.
+- `use` / `next` from a terminal start the browser login for that account with the email pre-filled.
 - Automatic switching skips that account and shows a macOS notification asking you to run `claude-switch login <name>`.
 
-A token revoked on the server (for example after logging out on claude.ai) cannot be detected without a request. Claude Code will report the auth error; run `claude-switch login <name>`.
+A login revoked on the server, for example after signing out everywhere on claude.ai, cannot be detected without a request. Claude Code will show an auth error; run `claude-switch login <name>`.
 
 ## Limits
 
-- macOS only. Uses the default config dir, not `CLAUDE_CONFIG_DIR`.
+- macOS only, default Claude Code config dir only.
 - All running sessions switch together, since they share the Keychain.
-- A manual `/login` with an account that is not saved blocks switching until you `add` it, so it is never overwritten by mistake.
-- When every account is at its limit it stays on the current one.
-- Usage numbers are only as fresh as the last response in any session.
-- Keychain writes pass the login JSON as an argument to `/usr/bin/security`, so it is visible to your own user's processes for a moment.
+- If you `/login` manually to an account that is not saved, switching stops until you `add` it, so that login is never overwritten.
+- If every account is at its limit, it stays on the current one and notifies you.
+- Usage numbers are as fresh as the last response in any session.
+- Keychain writes pass the login JSON to `/usr/bin/security` as an argument. It is visible to your own user's processes for a moment.
 
 Check Anthropic's terms for your plan before using several subscriptions.
 
-## Test
+## Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/PuntoyComaTech/claude-switch/main/install.sh | bash -s -- --uninstall
+```
+
+Removes the command, the saved logins and the state. The login Claude Code is currently using stays as it is.
+
+## Development
 
 ```sh
 ./tests/sandbox.sh
 ```
 
-Runs every flow against a fake Keychain in a temporary `HOME`. It never touches your real login.
+Runs every flow against a fake Keychain in a temporary `HOME`. It never touches your real login. See [AGENTS.md](AGENTS.md) for conventions.
 
 ## License
 
