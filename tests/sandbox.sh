@@ -33,6 +33,16 @@ printf '#!/bin/sh\necho "$*" >>"$KCDIR/notify"\n' >"$S/stub/osascript"
 # per-dir Keychain item, like Claude Code does.
 cat >"$S/stub/claude" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1 $2" = "auth status" ]; then
+  # Like Claude Code: load the login for this config dir and refresh it.
+  svc="Claude Code-credentials-$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 | cut -c1-8)"
+  cur=$(security find-generic-password -s "$svc" -a "$USER" -w) || { echo '{"loggedIn":false}'; exit 0; }
+  [ -f "$KCDIR/status-email" ] || { echo '{"loggedIn":false}'; exit 0; }
+  [ -f "$KCDIR/no-refresh" ] || security add-generic-password -U -s "$svc" -a "$USER" \
+    -w "$(jq -c '.claudeAiOauth.accessToken |= "ref-" + . | .claudeAiOauth.expiresAt = 9999999999999' <<<"$cur")"
+  echo "{\"loggedIn\":true,\"email\":\"$(cat "$KCDIR/status-email")\"}"
+  exit 0
+fi
 printf '%s' "$*" >"$KCDIR/login-args"
 [ "$1 $2" = "auth login" ] || exit 0
 [ -n "${CLAUDE_CONFIG_DIR:-}" ] || { echo "stub: login without CLAUDE_CONFIG_DIR" >&2; exit 1; }
@@ -154,6 +164,24 @@ ok "next makes no request" "$([ -f "$KCDIR/curl-args" ] && echo yes || echo no)"
 rm "$KCDIR/usage.json"
 "$BIN" list >/dev/null
 ok "failed request keeps last numbers" "$(jq -r ".usage.work.five | floor" "$ST")" 99
+
+# Expired inactive token: Claude Code refreshes it in a throwaway config dir.
+echo '{"five_hour":{"utilization":10,"resets_at":"2099-01-01T10:00:00Z"}}' >"$KCDIR/usage.json"
+before=$(live_token)
+echo z@x >"$KCDIR/status-email"
+"$BIN" list >/dev/null
+ok "refresh refused when Claude Code loads another account" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__extra")" new-c@x
+echo c@x >"$KCDIR/status-email"
+touch "$KCDIR/no-refresh"
+"$BIN" list >/dev/null
+ok "nothing saved when Claude Code does not refresh" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__extra")" new-c@x
+rm "$KCDIR/no-refresh"
+"$BIN" list >/dev/null
+ok "claude refreshes expired inactive token" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__extra")" ref-new-c@x
+ok "refreshed account gets usage" "$(jq -r '.usage.extra.five | floor' "$ST")" 10
+ok "refresh leaves live login" "$(live_token)" "$before"
+ok "refresh removes temp keychain items" "$(ls "$KCDIR" | grep -c 'credentials-')" 0
+ok "refresh removes temp dirs" "$(ls "$HOME/.claude-switch" | grep -c refresh)" 0
 
 "$BIN" threshold 50 >/dev/null
 ok "threshold is saved" "$("$BIN" threshold)" 50

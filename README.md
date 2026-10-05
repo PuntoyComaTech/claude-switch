@@ -11,7 +11,7 @@ switches automatically at 96% of either window
 ```
 
 - **Automatic.** Claude Code already sends your 5-hour and weekly usage to the status line. claude-switch reads it there and switches at 95%.
-- **Minimal traffic.** Automatic switching makes no requests. Only `list` reads the usage of inactive accounts, one request each. It never refreshes tokens; Claude Code keeps doing that.
+- **Minimal traffic.** Automatic switching makes no requests. Only `list` reads the usage of inactive accounts, one request each. Token refreshes are always done by the official Claude Code binary.
 - **Adding an account does not touch your sessions.** The browser login for a new account happens in an isolated config, so running sessions stay where they are.
 - **One bash script.** Needs `jq`, which ships with recent macOS.
 
@@ -100,8 +100,9 @@ Claude Code keeps its login in the macOS Keychain (item `Claude Code-credentials
 
 The status line only carries the active account's usage. `list` reads the others from `https://api.anthropic.com/api/oauth/usage`, the endpoint behind Claude Code's `/usage`:
 
-- One request per inactive account, only when you run `list`.
-- Only while that account's saved access token is still valid. Access tokens last a few hours, and claude-switch never refreshes them. With an expired token, `list` shows the last known numbers and how old they are.
+- One request per inactive account, all in parallel, only when you run `list`.
+- If an account's saved access token has expired, claude-switch does not refresh it itself. It loads that login into a throwaway config dir and runs the official `claude auth status`, which refreshes it. It saves what Claude Code wrote back and deletes the temporary copy. The live login is never touched.
+- If Claude Code does not load or refresh that login, nothing is saved, `list` shows the last known numbers with their age, and the reason goes to the log.
 - It identifies itself as `claude-switch/<version>`. It does not pretend to be Claude Code.
 - The token goes to `curl` through stdin, not as an argument.
 

@@ -208,7 +208,7 @@ require_account() {
 }
 
 # Read usage for a saved, inactive account with its saved access token.
-# Never refreshes: an expired token returns 2 and the last known numbers stay.
+# An expired token returns 2 so the caller can refresh through Claude Code.
 # Identifies itself honestly as claude-switch.
 fetch_usage() {
   local name=$1 profile token body code usage
@@ -231,6 +231,46 @@ fetch_usage() {
   lock
   state_update '.usage[$n] = $u' --arg n "$name" --argjson u "$usage"
   unlock
+}
+
+# Claude Code names its Keychain item after the config dir it runs with.
+cc_service_for() { printf 'Claude Code-credentials-%s' "$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"; }
+
+# Have the official Claude Code binary refresh an inactive account's token:
+# load the saved login into a throwaway config dir, run `claude auth status`,
+# and save whatever Claude Code wrote back. The live login is never touched.
+refresh_via_claude() {
+  local name=$1 profile email cfg svc status fresh acct
+  profile=$(kc_read "$STORE_SERVICE" "$name") || return 1
+  email=$(state_get --arg n "$name" '.accounts[$n].email')
+  cfg=$(mktemp -d "$DIR/refresh.XXXXXX")
+  svc=$(cc_service_for "$cfg")
+  kc_write "$svc" "$KC_ACCOUNT" "$(printf '%s' "$profile" | jq -c '.login')"
+  status=$(CLAUDE_CONFIG_DIR="$cfg" claude auth status --json 2>/dev/null || true)
+  fresh=$(kc_read "$svc" "$KC_ACCOUNT" || true)
+  if [ "$(jq -r '.email // empty' <<<"$status" 2>/dev/null)" != "$email" ]; then
+    log "refresh $name: Claude Code did not load the login"
+  elif [ "$(printf '%s' "$fresh" | jq '(.claudeAiOauth.expiresAt // 0) / 1000 > now + 60' 2>/dev/null)" != true ]; then
+    log "refresh $name: Claude Code did not refresh the token"
+  else
+    acct=$(printf '%s' "$profile" | jq -c '.oauthAccount')
+    lock
+    save_profile "$name" "$fresh" "$acct" "$email"
+    unlock
+    security delete-generic-password -s "$svc" -a "$KC_ACCOUNT" >/dev/null 2>&1 || true
+    rm -rf "$cfg"
+    return 0
+  fi
+  security delete-generic-password -s "$svc" -a "$KC_ACCOUNT" >/dev/null 2>&1 || true
+  rm -rf "$cfg"
+  return 1
+}
+
+# Usage for one inactive account; refreshes through Claude Code when needed.
+update_usage() {
+  local rc=0
+  fetch_usage "$1" || rc=$?
+  if [ "$rc" = 2 ] && refresh_via_claude "$1"; then fetch_usage "$1" || true; fi
 }
 
 # --- commands ---------------------------------------------------------------
@@ -368,10 +408,11 @@ meter() {
 cmd_list() {
   local active name email five five_r seven seven_r dead at mark
   # The active account's usage comes from the status line. Inactive ones are
-  # read here, once per list, while their saved token is still valid.
+  # read here, all at once, once per list.
   for name in $(state_get '.active as $a | .order[] | select(. != $a)'); do
-    fetch_usage "$name" || true
+    update_usage "$name" &
   done
+  wait
   if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' YELLOW=$'\e[33m' GREEN=$'\e[32m' RESET=$'\e[0m'
   else
