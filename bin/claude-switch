@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# claude-switch: swap Claude Code subscription accounts on macOS.
+# Saved logins live in the login Keychain. Usage comes from the status line
+# JSON that Claude Code already provides, so this tool never calls an API.
+set -euo pipefail
+
+VERSION="0.1.0"
+CC_SERVICE="Claude Code-credentials"
+STORE_SERVICE="claude-switch"
+KC_ACCOUNT="${USER:-$(id -un)}"
+DIR="${CLAUDE_SWITCH_DIR:-$HOME/.claude-switch}"
+STATE="$DIR/state.json"
+LOCK="$DIR/lock"
+LOG="$DIR/log"
+CLAUDE_JSON="$HOME/.claude.json"
+CREDS_FILE="$HOME/.claude/.credentials.json"
+THRESHOLD="${CLAUDE_SWITCH_THRESHOLD:-95}"
+# Keychain keys that belong to a login. Everything else (mcpOAuth, ...) stays.
+LOGIN_KEYS='["claudeAiOauth","organizationUuid","trustedDeviceToken","enterpriseGateway"]'
+
+die() { echo "claude-switch: $*" >&2; exit 1; }
+log() { mkdir -p "$DIR"; echo "$(date '+%F %T') $*" >>"$LOG"; }
+notify() {
+  log "notify: $1"
+  osascript -e "display notification \"$1\" with title \"claude-switch\"" >/dev/null 2>&1 || true
+}
+
+# --- keychain ---------------------------------------------------------------
+
+kc_read() { security find-generic-password -s "$1" -a "$2" -w 2>/dev/null; }
+
+kc_write() {
+  security add-generic-password -U -s "$1" -a "$2" -w "$3" >/dev/null \
+    || die "could not write keychain item $1/$2"
+  [ "$(kc_read "$1" "$2")" = "$3" ] || die "keychain write to $1/$2 did not verify"
+}
+
+# --- state ------------------------------------------------------------------
+
+state_init() {
+  mkdir -p "$DIR"
+  chmod 700 "$DIR"
+  [ -f "$STATE" ] || echo '{"active":null,"order":[],"accounts":{},"usage":{},"sessions":{}}' >"$STATE"
+}
+
+# state_update <jq filter> [jq args...]
+state_update() {
+  local filter=$1 tmp
+  shift
+  tmp=$(mktemp "$DIR/.state.XXXXXX")
+  jq "$@" "$filter" "$STATE" >"$tmp" && mv "$tmp" "$STATE"
+}
+
+state_get() { jq -r "$@" "$STATE"; }
+
+lock() {
+  local i=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    if [ $((i++)) -gt 50 ]; then
+      if [ $(($(date +%s) - $(stat -f %m "$LOCK"))) -gt 60 ]; then
+        rmdir "$LOCK" 2>/dev/null || true
+      else
+        die "another switch is in progress"
+      fi
+    fi
+    sleep 0.2
+  done
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+}
+
+unlock() { rmdir "$LOCK" 2>/dev/null || true; trap - EXIT; }
+
+# --- accounts ---------------------------------------------------------------
+
+live_email() { jq -r '.oauthAccount.emailAddress // empty' "$CLAUDE_JSON" 2>/dev/null; }
+
+# Copy the live login and oauthAccount into the saved profile <name>.
+snapshot() {
+  local name=$1 live acct email profile rt_exp
+  live=$(kc_read "$CC_SERVICE" "$KC_ACCOUNT") || die "no Claude Code login found in the Keychain"
+  acct=$(jq -c '.oauthAccount // null' "$CLAUDE_JSON")
+  [ "$acct" != null ] || die "no oauthAccount in $CLAUDE_JSON; run 'claude' once after logging in"
+  email=$(jq -r '.emailAddress' <<<"$acct")
+  # Secrets go through stdin, never argv.
+  profile=$(printf '%s' "$live" | jq -c --argjson acct "$acct" --argjson keys "$LOGIN_KEYS" \
+    '{login: with_entries(select(.key as $k | $keys | index($k))), oauthAccount: $acct}')
+  rt_exp=$(printf '%s' "$live" | jq '.claudeAiOauth.refreshTokenExpiresAt // null')
+  kc_write "$STORE_SERVICE" "$name" "$profile"
+  state_update '.accounts[$n] = {email: $e, rt_exp: $r} | .order |= (if index($n) then . else . + [$n] end)' \
+    --arg n "$name" --arg e "$email" --argjson r "$rt_exp"
+}
+
+# Save the active account's live login, since Claude Code rotates its tokens.
+snapshot_active() {
+  local active expected live
+  active=$(state_get '.active // empty')
+  [ -n "$active" ] || return 0
+  expected=$(state_get --arg n "$active" '.accounts[$n].email')
+  live=$(live_email)
+  [ "$live" = "$expected" ] \
+    || die "live login is '$live' but '$active' is '$expected'. Save it first: claude-switch add <name>"
+  snapshot "$active"
+}
+
+# Put saved profile <name> into Claude Code's Keychain item and ~/.claude.json.
+restore() {
+  local name=$1 profile live merged acct tmp try
+  profile=$(kc_read "$STORE_SERVICE" "$name") || die "no saved account '$name'"
+  live=$(kc_read "$CC_SERVICE" "$KC_ACCOUNT" || echo '{}')
+  merged=$(printf '%s\n%s' "$live" "$profile" | jq -cs --argjson keys "$LOGIN_KEYS" \
+    '(.[0] | with_entries(select(.key as $k | $keys | index($k) | not))) + .[1].login')
+  acct=$(printf '%s' "$profile" | jq -c '.oauthAccount')
+  # Keychain first, then the files: a running session re-reads the Keychain
+  # when the credentials file mtime changes.
+  kc_write "$CC_SERVICE" "$KC_ACCOUNT" "$merged"
+  for try in 1 2 3; do
+    tmp=$(mktemp "$HOME/.claude.json.XXXXXX")
+    if jq --argjson a "$acct" '.oauthAccount = $a' "$CLAUDE_JSON" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$CLAUDE_JSON"
+      break
+    fi
+    rm -f "$tmp"
+    [ "$try" = 3 ] && die "could not update $CLAUDE_JSON"
+    sleep 0.5 # Claude Code may be mid-write
+  done
+  [ -f "$CREDS_FILE" ] && touch "$CREDS_FILE"
+  state_update '.active = $n | .last_switch = now' --arg n "$name"
+}
+
+# Exit 0 when the saved refresh token is known to have expired.
+is_dead() {
+  state_get --arg n "$1" '(.accounts[$n].rt_exp // null) as $r | $r != null and $r / 1000 < now' | grep -qx true
+}
+
+is_exhausted() {
+  state_get --arg n "$1" --argjson t "$THRESHOLD" '
+    (.usage[$n] // {}) as $u
+    | ((($u.five // 0) >= $t and ($u.five_reset // 0) > now)
+       or (($u.seven // 0) >= $t and ($u.seven_reset // 0) > now))' | grep -qx true
+}
+
+require_account() {
+  [ "$(state_get --arg n "$1" '.accounts[$n] != null')" = true ] || die "unknown account '$1'. See: claude-switch list"
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_add() {
+  local name=${1:-} live existing
+  [ -n "$name" ] || die "usage: claude-switch add <name>"
+  live=$(live_email)
+  existing=$(state_get --arg n "$name" '.accounts[$n].email // empty')
+  [ -z "$existing" ] || [ "$existing" = "$live" ] \
+    || die "'$name' is '$existing' but you are logged in as '$live'"
+  lock
+  snapshot "$name"
+  state_update '.active = $n' --arg n "$name"
+  echo "saved '$name' ($live) and marked it active"
+}
+
+cmd_use() {
+  local name=${1:-} auto=${2:-}
+  [ -n "$name" ] || die "usage: claude-switch use <name>"
+  require_account "$name"
+  [ "$(state_get '.active // empty')" != "$name" ] || { echo "already on '$name'"; return 0; }
+  if is_dead "$name"; then
+    if [ "$auto" = auto ]; then
+      notify "'$name' needs a new login: claude-switch login $name"
+      return 1
+    fi
+    echo "'$name' refresh token expired, logging in again"
+    cmd_login "$name"
+    return
+  fi
+  lock
+  snapshot_active
+  restore "$name"
+  unlock
+  log "switched to $name"
+  echo "now on '$name' ($(state_get --arg n "$name" '.accounts[$n].email'))"
+}
+
+cmd_next() {
+  local auto=${1:-} active name candidates
+  active=$(state_get '.active // empty')
+  # Accounts after the active one, wrapping around.
+  candidates=$(state_get --arg a "$active" '.order as $o | ($o | index($a) // -1) as $i | ($o[$i+1:] + $o[:$i+1])[] | select(. != $a)')
+  for name in $candidates; do
+    is_exhausted "$name" && continue
+    if [ "$auto" = auto ] && is_dead "$name"; then
+      notify "'$name' needs a new login: claude-switch login $name"
+      continue
+    fi
+    cmd_use "$name" "$auto" && return 0
+  done
+  if [ "$auto" = auto ]; then notify "every account is at its limit; staying on '$active'"; fi
+  die "no other account available"
+}
+
+cmd_login() {
+  local name=${1:-} email live
+  [ -n "$name" ] || die "usage: claude-switch login <name>"
+  email=$(state_get --arg n "$name" '.accounts[$n].email // empty')
+  lock
+  snapshot_active
+  unlock
+  if [ -n "$email" ]; then claude auth login --email "$email"; else claude auth login; fi
+  sleep 1
+  live=$(live_email)
+  [ -z "$email" ] || [ "$live" = "$email" ] \
+    || die "logged in as '$live', expected '$email'. Run 'claude-switch add <name>' to keep it"
+  lock
+  snapshot "$name"
+  state_update '.active = $n | .last_switch = now' --arg n "$name"
+  echo "logged in and saved '$name' ($live)"
+}
+
+# Called from the status line with its JSON on stdin.
+cmd_report() {
+  local input out
+  input=$(cat)
+  [ "$(state_get '.active // empty')" ] || return 0
+  lock
+  # Ignore repeats: a session shows its last response's numbers until the next
+  # response, which right after a switch still belong to the old account.
+  out=$(jq -c --argjson in "$input" --argjson t "$THRESHOLD" '
+    ($in.rate_limits // {}) as $r
+    | if $r.five_hour == null then {state: ., switch: false}
+      else
+        ($r.five_hour.used_percentage // 0) as $f
+        | ($r.seven_day.used_percentage // 0) as $w
+        | "\($f)|\($r.five_hour.resets_at)|\($w)|\($r.seven_day.resets_at)" as $sig
+        | ($in.session_id // "none") as $sid
+        | if .sessions[$sid].sig == $sig then {state: ., switch: false}
+          else
+            .sessions[$sid] = {sig: $sig, at: now}
+            | .sessions |= with_entries(select(.value.at > now - 86400))
+            | .usage[.active] = {five: $f, five_reset: $r.five_hour.resets_at,
+                                 seven: $w, seven_reset: $r.seven_day.resets_at, at: now}
+            | {state: ., switch: ($f >= $t or $w >= $t)}
+          end
+      end' "$STATE")
+  state_update '$o.state' --argjson o "$out"
+  unlock
+  if [ "$(jq -r '.switch' <<<"$out")" = true ]; then
+    log "limit reached on $(state_get '.active')"
+    cmd_next auto
+  fi
+}
+
+cmd_list() {
+  state_get --argjson t "$THRESHOLD" '
+    .active as $a | .usage as $u | .accounts as $acc
+    | .order[]
+    | . as $n
+    | ($u[$n] // {}) as $x
+    | def pct($v; $r): if $v == null or ($r // 0) < now then "-" else "\($v | floor)%" end;
+      def when($r): if ($r // 0) < now then "" else " resets \($r | strflocaltime("%a %H:%M"))" end;
+      (if $n == $a then "* " else "  " end)
+      + "\($n)\t\($acc[$n].email)\t5h \(pct($x.five; $x.five_reset))\(when($x.five_reset))"
+      + "\t7d \(pct($x.seven; $x.seven_reset))"
+      + (if ($acc[$n].rt_exp // null) != null and $acc[$n].rt_exp / 1000 < now then "\tLOGIN NEEDED" else "" end)'
+}
+
+cmd_current() { state_get '.active // empty'; }
+
+cmd_remove() {
+  local name=${1:-}
+  [ -n "$name" ] || die "usage: claude-switch remove <name>"
+  require_account "$name"
+  [ "$(state_get '.active // empty')" != "$name" ] || die "'$name' is active; switch first"
+  security delete-generic-password -s "$STORE_SERVICE" -a "$name" >/dev/null 2>&1 || true
+  state_update 'del(.accounts[$n], .usage[$n]) | .order -= [$n]' --arg n "$name"
+  echo "removed '$name'"
+}
+
+usage() {
+  cat <<EOF
+claude-switch $VERSION - swap Claude Code subscription accounts on macOS
+
+  add <name>     save the account you are logged in with
+  use <name>     switch to a saved account (logs in again if its token expired)
+  next           switch to the next account that is not at its limit
+  login <name>   log in again to a saved account and save it
+  list           show accounts and their last known usage
+  current        print the active account name
+  remove <name>  delete a saved account
+  report         read status line JSON on stdin; switch when over the limit
+
+Env: CLAUDE_SWITCH_THRESHOLD (default 95), CLAUDE_SWITCH_DIR (default ~/.claude-switch)
+EOF
+}
+
+main() {
+  command -v jq >/dev/null || die "jq is required"
+  [ "$(uname)" = Darwin ] || die "macOS only"
+  state_init
+  local cmd=${1:-help}
+  shift || true
+  case "$cmd" in
+    add) cmd_add "$@" ;;
+    use) cmd_use "$@" ;;
+    next) cmd_next "$@" ;;
+    login) cmd_login "$@" ;;
+    list | ls | status) cmd_list ;;
+    current) cmd_current ;;
+    remove | rm) cmd_remove "$@" ;;
+    report) cmd_report ;;
+    -v | --version) echo "$VERSION" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
