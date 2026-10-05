@@ -63,6 +63,7 @@ No status line yet? See [statusline-example.sh](statusline-example.sh) and add t
 | `login <name>` | Log in again to a saved account and save it |
 | `list` | Accounts, last known usage, and which need a login |
 | `current` | Print the active account |
+| `rename <old> <new>` | Rename a saved account |
 | `remove <name>` | Delete a saved account |
 | `report` | Read status line JSON on stdin, switch when over the limit |
 

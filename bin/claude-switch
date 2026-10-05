@@ -264,6 +264,23 @@ cmd_list() {
 
 cmd_current() { state_get '.active // empty'; }
 
+cmd_rename() {
+  local old=${1:-} new=${2:-} profile
+  [ -n "$old" ] && [ -n "$new" ] || die "usage: claude-switch rename <old> <new>"
+  require_account "$old"
+  [ "$(state_get --arg n "$new" '.accounts[$n] == null')" = true ] || die "'$new' already exists"
+  lock
+  profile=$(kc_read "$STORE_SERVICE" "$old") || die "no saved account '$old'"
+  kc_write "$STORE_SERVICE" "$new" "$profile"
+  security delete-generic-password -s "$STORE_SERVICE" -a "$old" >/dev/null 2>&1 || true
+  state_update '
+    .accounts[$b] = .accounts[$a] | del(.accounts[$a])
+    | (if .usage[$a] then .usage[$b] = .usage[$a] | del(.usage[$a]) else . end)
+    | .order |= map(if . == $a then $b else . end)
+    | (if .active == $a then .active = $b else . end)' --arg a "$old" --arg b "$new"
+  echo "renamed '$old' to '$new'"
+}
+
 cmd_remove() {
   local name=${1:-}
   [ -n "$name" ] || die "usage: claude-switch remove <name>"
@@ -284,6 +301,7 @@ claude-switch $VERSION - swap Claude Code subscription accounts on macOS
   login <name>   log in again to a saved account and save it
   list           show accounts and their last known usage
   current        print the active account name
+  rename <old> <new>  rename a saved account
   remove <name>  delete a saved account
   report         read status line JSON on stdin; switch when over the limit
 
@@ -304,6 +322,7 @@ main() {
     login) cmd_login "$@" ;;
     list | ls | status) cmd_list ;;
     current) cmd_current ;;
+    rename | mv) cmd_rename "$@" ;;
     remove | rm) cmd_remove "$@" ;;
     report) cmd_report ;;
     -v | --version) echo "$VERSION" ;;

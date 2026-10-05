@@ -85,6 +85,11 @@ ok "auto skips dead account" "$("$BIN" current)" b
 ok "auto notifies dead account" "$(grep -c 'claude-switch login a' "$KCDIR/notify")" 1
 "$BIN" use a >/dev/null 2>&1
 ok "manual use of dead account starts login with email" "$(cat "$KCDIR/login-args")" "auth login --email a@x"
+"$BIN" rename b work >/dev/null
+ok "rename moves active" "$("$BIN" current)" work
+ok "rename moves saved login" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__work")" tokB2
+ok "rename drops old login" "$([ -f "$KCDIR/claude-switch__b" ] && echo yes || echo no)" no
+ok "rename keeps order" "$(jq -c .order "$HOME/.claude-switch/state.json")" '["a","work"]'
 "$BIN" list >"$S/list" 2>&1
 ok "list renders" "$?" 0
 cat "$S/list"
