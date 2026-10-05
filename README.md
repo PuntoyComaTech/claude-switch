@@ -11,7 +11,7 @@ switches automatically at 96% of either window
 ```
 
 - **Automatic.** Claude Code already sends your 5-hour and weekly usage to the status line. claude-switch reads it there and switches at 95%.
-- **No extra traffic.** It never calls Anthropic APIs and never refreshes tokens itself. Claude Code keeps doing that.
+- **Minimal traffic.** Automatic switching makes no requests. Only `list` reads the usage of inactive accounts, one request each. It never refreshes tokens; Claude Code keeps doing that.
 - **Adding an account does not touch your sessions.** The browser login for a new account happens in an isolated config, so running sessions stay where they are.
 - **One bash script.** Needs `jq`, which ships with recent macOS.
 
@@ -51,7 +51,7 @@ That is all. Use Claude Code as usual. When the active account reaches the thres
 
 | Command | What it does |
 |---|---|
-| `claude-switch list` | Accounts, last known usage, which one is active, which need a login |
+| `claude-switch list` | Accounts, usage, which one is active, which need a login |
 | `claude-switch use <name>` | Switch now. Running sessions follow on their next request |
 | `claude-switch next` | Switch to the next account that is not at its limit |
 | `claude-switch add <name>` | Save the account you are logged in with |
@@ -96,6 +96,17 @@ Claude Code keeps its login in the macOS Keychain (item `Claude Code-credentials
 
 `add --login` runs `claude auth login` with `CLAUDE_CONFIG_DIR` pointing at a temporary folder. Claude Code stores that login in a separate Keychain item. claude-switch copies it and deletes the temporary item and folder. If a Claude Code version wrote the main item anyway, claude-switch restores the original.
 
+### Usage of inactive accounts
+
+The status line only carries the active account's usage. `list` reads the others from `https://api.anthropic.com/api/oauth/usage`, the endpoint behind Claude Code's `/usage`:
+
+- One request per inactive account, only when you run `list`.
+- Only while that account's saved access token is still valid. Access tokens last a few hours, and claude-switch never refreshes them. With an expired token, `list` shows the last known numbers and how old they are.
+- It identifies itself as `claude-switch/<version>`. It does not pretend to be Claude Code.
+- The token goes to `curl` through stdin, not as an argument.
+
+This endpoint is not documented by Anthropic and may change. If it fails, `list` keeps the last numbers and writes the error to the log.
+
 ## Expired logins
 
 claude-switch checks the saved refresh-token expiry date locally, with no request:
@@ -111,7 +122,7 @@ A login revoked on the server, for example after signing out everywhere on claud
 - All running sessions switch together, since they share the Keychain.
 - If you `/login` manually to an account that is not saved, switching stops until you `add` it, so that login is never overwritten.
 - If every account is at its limit, it stays on the current one and notifies you.
-- Usage numbers are as fresh as the last response in any session.
+- The active account's numbers are as fresh as its last response. Inactive accounts update when you run `list` and their token is still valid.
 - Keychain writes pass the login JSON to `/usr/bin/security` as an argument. It is visible to your own user's processes for a moment.
 
 Check Anthropic's terms for your plan before using several subscriptions.

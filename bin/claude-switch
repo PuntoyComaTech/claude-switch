@@ -14,6 +14,7 @@ LOCK="$DIR/lock"
 LOG="$DIR/log"
 CLAUDE_JSON="$HOME/.claude.json"
 CREDS_FILE="$HOME/.claude/.credentials.json"
+USAGE_URL="${CLAUDE_SWITCH_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
 # Keychain keys that belong to a login. Everything else (mcpOAuth, ...) stays.
 LOGIN_KEYS='["claudeAiOauth","organizationUuid","trustedDeviceToken","enterpriseGateway"]'
 
@@ -206,6 +207,32 @@ require_account() {
   [ "$(state_get --arg n "$1" '.accounts[$n] != null')" = true ] || die "unknown account '$1'. See: claude-switch list"
 }
 
+# Read usage for a saved, inactive account with its saved access token.
+# Never refreshes: an expired token returns 2 and the last known numbers stay.
+# Identifies itself honestly as claude-switch.
+fetch_usage() {
+  local name=$1 profile token body code usage
+  profile=$(kc_read "$STORE_SERVICE" "$name") || return 1
+  [ "$(printf '%s' "$profile" | jq '(.login.claudeAiOauth.expiresAt // 0) / 1000 > now + 60')" = true ] || return 2
+  token=$(printf '%s' "$profile" | jq -r '.login.claudeAiOauth.accessToken // empty')
+  [ -n "$token" ] || return 1
+  # The header goes through stdin (printf is a builtin), so the token never hits argv.
+  body=$(printf 'Authorization: Bearer %s\n' "$token" | curl -sS -m 10 -w '\n%{http_code}' -H @- \
+    -H 'anthropic-beta: oauth-2025-04-20' -H "User-Agent: claude-switch/$VERSION" \
+    "$USAGE_URL" 2>/dev/null) || { log "usage $name: request failed"; return 1; }
+  code=${body##*$'\n'}
+  body=${body%$'\n'*}
+  [ "$code" = 200 ] || { log "usage $name: HTTP $code"; return 1; }
+  usage=$(jq -c '
+    def epoch: if . == null then null else sub("\\.[0-9]+"; "") | sub("[+]00:00$"; "Z") | fromdateiso8601 end;
+    {five: .five_hour.utilization, five_reset: (.five_hour.resets_at | epoch),
+     seven: .seven_day.utilization, seven_reset: (.seven_day.resets_at | epoch), at: now, src: "api"}' \
+    <<<"$body") || { log "usage $name: unexpected response"; return 1; }
+  lock
+  state_update '.usage[$n] = $u' --arg n "$name" --argjson u "$usage"
+  unlock
+}
+
 # --- commands ---------------------------------------------------------------
 
 cmd_add() {
@@ -320,6 +347,14 @@ human_in() {
   else echo "$((s / 60 + 1))m"; fi
 }
 
+human_ago() {
+  local s=$(($(date +%s) - $1))
+  if [ "$s" -lt 60 ]; then echo "just now"
+  elif [ "$s" -lt 3600 ]; then echo "$((s / 60))m ago"
+  elif [ "$s" -lt 86400 ]; then echo "$((s / 3600))h ago"
+  else echo "$((s / 86400))d ago"; fi
+}
+
 # meter <percent|empty> <reset epoch|empty>
 meter() {
   local p=${1:-} r=${2:-} n i bar="" color
@@ -331,20 +366,26 @@ meter() {
 }
 
 cmd_list() {
-  local active name email five five_r seven seven_r dead mark
+  local active name email five five_r seven seven_r dead at mark
+  # The active account's usage comes from the status line. Inactive ones are
+  # read here, once per list, while their saved token is still valid.
+  for name in $(state_get '.active as $a | .order[] | select(. != $a)'); do
+    fetch_usage "$name" || true
+  done
   if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' YELLOW=$'\e[33m' GREEN=$'\e[32m' RESET=$'\e[0m'
   else
     BOLD="" DIM="" RED="" YELLOW="" GREEN="" RESET=""
   fi
   [ "$(state_get '.order | length')" -gt 0 ] || { echo "no accounts yet. Run: claude-switch add <name>"; return; }
-  printf '%s  %-12s %-34s %-37s %s%s\n' "$DIM" ACCOUNT EMAIL "SESSION (5h)" "WEEKLY (7d)" "$RESET"
+  printf '%s  %-12s %-34s %-37s %-37s %s%s\n' "$DIM" ACCOUNT EMAIL "SESSION (5h)" "WEEKLY (7d)" UPDATED "$RESET"
   # Windows whose reset time has passed show as no data.
-  while IFS='|' read -r active name email five five_r seven seven_r dead; do
+  while IFS='|' read -r active name email five five_r seven seven_r dead at; do
     mark="  "
     [ "$active" = true ] && mark="${GREEN}●${RESET} "
     printf '%s%s%-12s%s %-34s %s   %s' "$mark" "$BOLD" "$name" "$RESET" "$email" \
       "$(meter "$five" "$five_r")" "$(meter "$seven" "$seven_r")"
+    [ -n "$at" ] && printf '   %s%s%s' "$DIM" "$(human_ago "$at")" "$RESET"
     [ "$dead" = true ] && printf '  %sLOGIN NEEDED: claude-switch login %s%s' "$RED" "$name" "$RESET"
     printf '\n'
   done < <(state_get '
@@ -356,7 +397,8 @@ cmd_list() {
       [($n == $a | tostring), $n, $acc[$n].email,
        live($x.five; $x.five_reset), at($x.five; $x.five_reset),
        live($x.seven; $x.seven_reset), at($x.seven; $x.seven_reset),
-       ((($acc[$n].rt_exp // null) != null and $acc[$n].rt_exp / 1000 < now) | tostring)]
+       ((($acc[$n].rt_exp // null) != null and $acc[$n].rt_exp / 1000 < now) | tostring),
+       ($x.at // "" | if . == "" then "" else floor | tostring end)]
     | join("|")')
   printf '\n%sswitches automatically at %s%% of either window%s\n' "$DIM" "$THRESHOLD" "$RESET"
 }
@@ -408,7 +450,7 @@ claude-switch $VERSION - swap Claude Code subscription accounts on macOS
   use <name>     switch to a saved account (logs in again if its token expired)
   next           switch to the next account that is not at its limit
   login <name>   log in again to a saved account (same isolated login)
-  list           show accounts and their last known usage
+  list           show accounts and usage (reads inactive accounts once)
   current        print the active account name
   threshold [n]  show or set the usage % that triggers a switch (default 95)
   rename <old> <new>  rename a saved account

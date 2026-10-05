@@ -42,6 +42,14 @@ security add-generic-password -U -s "$svc" -a "$USER" \
   -w "{\"claudeAiOauth\":{\"accessToken\":\"new-$PICK\",\"refreshTokenExpiresAt\":9999999999999}}"
 jq -n --arg e "$PICK" '{oauthAccount:{emailAddress:$e}}' >"$CLAUDE_CONFIG_DIR/.claude.json"
 EOF
+# Fake usage API: records argv and stdin, answers with $KCDIR/usage.json.
+cat >"$S/stub/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$KCDIR/curl-args"
+cat >"$KCDIR/curl-stdin"
+[ -f "$KCDIR/usage.json" ] || { printf '\n500'; exit 0; }
+cat "$KCDIR/usage.json"; printf '\n200'
+EOF
 chmod +x "$S/stub/"*
 
 export KCDIR="$S/kc" HOME="$S/home" PATH="$S/stub:$PATH" USER=tester
@@ -125,6 +133,28 @@ ok "rename drops old login" "$([ -f "$KCDIR/claude-switch__b" ] && echo yes || e
 "$BIN" rename a main >/dev/null
 ok "rename moves active" "$("$BIN" current)" main
 ok "rename keeps order" "$(jq -c .order "$HOME/.claude-switch/state.json")" '["main","work","extra"]'
+# Usage API for inactive accounts. "work" (b@x) gets a valid access token.
+ST="$HOME/.claude-switch/state.json"
+jq -c '.login.claudeAiOauth.expiresAt = 9999999999999' "$KCDIR/claude-switch__work" >"$S/t" && mv "$S/t" "$KCDIR/claude-switch__work"
+cat >"$KCDIR/usage.json" <<'EOF'
+{"five_hour":{"utilization":99.0,"resets_at":"2099-01-01T10:00:00.123456+00:00"},"seven_day":{"utilization":20.0,"resets_at":"2099-01-05T10:00:00+00:00"}}
+EOF
+"$BIN" list >/dev/null
+ok "list reads usage of inactive account" "$(jq -r ".usage.work.five | floor" "$ST")" 99
+ok "list parses reset time" "$(jq -r .usage.work.five_reset "$ST")" 4070944800
+ok "list skips expired token" "$(jq -r '.usage.extra // "none"' "$ST")" none
+ok "token not in curl argv" "$(grep -c tokB2 "$KCDIR/curl-args")" 0
+ok "token sent via stdin header" "$(cat "$KCDIR/curl-stdin")" "Authorization: Bearer tokB2"
+ok "honest user agent" "$(grep -c 'User-Agent: claude-switch/' "$KCDIR/curl-args")" 1
+rm "$KCDIR/curl-args"
+"$BIN" next >/dev/null 2>&1
+ok "next skips account known exhausted" "$("$BIN" current)" extra
+ok "next makes no request" "$([ -f "$KCDIR/curl-args" ] && echo yes || echo no)" no
+"$BIN" use main >/dev/null
+rm "$KCDIR/usage.json"
+"$BIN" list >/dev/null
+ok "failed request keeps last numbers" "$(jq -r ".usage.work.five | floor" "$ST")" 99
+
 "$BIN" threshold 50 >/dev/null
 ok "threshold is saved" "$("$BIN" threshold)" 50
 ok "env overrides saved threshold" "$(CLAUDE_SWITCH_THRESHOLD=70 "$BIN" threshold)" 70
