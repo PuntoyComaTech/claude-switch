@@ -14,7 +14,6 @@ LOCK="$DIR/lock"
 LOG="$DIR/log"
 CLAUDE_JSON="$HOME/.claude.json"
 CREDS_FILE="$HOME/.claude/.credentials.json"
-THRESHOLD="${CLAUDE_SWITCH_THRESHOLD:-95}"
 # Keychain keys that belong to a login. Everything else (mcpOAuth, ...) stays.
 LOGIN_KEYS='["claudeAiOauth","organizationUuid","trustedDeviceToken","enterpriseGateway"]'
 
@@ -313,18 +312,61 @@ cmd_report() {
   fi
 }
 
+# "4h 12m", "2d 3h"
+human_in() {
+  local s=$(($1 - $(date +%s)))
+  if [ "$s" -ge 86400 ]; then echo "$((s / 86400))d $((s % 86400 / 3600))h"
+  elif [ "$s" -ge 3600 ]; then echo "$((s / 3600))h $((s % 3600 / 60))m"
+  else echo "$((s / 60 + 1))m"; fi
+}
+
+# meter <percent|empty> <reset epoch|empty>
+meter() {
+  local p=${1:-} r=${2:-} n i bar="" color
+  if [ -z "$p" ]; then printf '%s%-34s%s' "$DIM" "no data yet" "$RESET"; return; fi
+  n=$(((p + 5) / 10))
+  for ((i = 0; i < 10; i++)); do if [ "$i" -lt "$n" ]; then bar+="█"; else bar+="░"; fi; done
+  if [ "$p" -ge "$THRESHOLD" ]; then color=$RED; elif [ "$p" -ge 75 ]; then color=$YELLOW; else color=$GREEN; fi
+  printf '%s%s %3d%%%s  %sresets in %-7s%s' "$color" "$bar" "$p" "$RESET" "$DIM" "$(human_in "$r")" "$RESET"
+}
+
 cmd_list() {
-  state_get --argjson t "$THRESHOLD" '
+  local active name email five five_r seven seven_r dead mark
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' YELLOW=$'\e[33m' GREEN=$'\e[32m' RESET=$'\e[0m'
+  else
+    BOLD="" DIM="" RED="" YELLOW="" GREEN="" RESET=""
+  fi
+  [ "$(state_get '.order | length')" -gt 0 ] || { echo "no accounts yet. Run: claude-switch add <name>"; return; }
+  printf '%s  %-12s %-34s %-37s %s%s\n' "$DIM" ACCOUNT EMAIL "SESSION (5h)" "WEEKLY (7d)" "$RESET"
+  # Windows whose reset time has passed show as no data.
+  while IFS='|' read -r active name email five five_r seven seven_r dead; do
+    mark="  "
+    [ "$active" = true ] && mark="${GREEN}●${RESET} "
+    printf '%s%s%-12s%s %-34s %s   %s' "$mark" "$BOLD" "$name" "$RESET" "$email" \
+      "$(meter "$five" "$five_r")" "$(meter "$seven" "$seven_r")"
+    [ "$dead" = true ] && printf '  %sLOGIN NEEDED: claude-switch login %s%s' "$RED" "$name" "$RESET"
+    printf '\n'
+  done < <(state_get '
     .active as $a | .usage as $u | .accounts as $acc
-    | .order[]
-    | . as $n
+    | .order[] as $n
     | ($u[$n] // {}) as $x
-    | def pct($v; $r): if $v == null or ($r // 0) < now then "-" else "\($v | floor)%" end;
-      def when($r): if ($r // 0) < now then "" else " resets \($r | strflocaltime("%a %H:%M"))" end;
-      (if $n == $a then "* " else "  " end)
-      + "\($n)\t\($acc[$n].email)\t5h \(pct($x.five; $x.five_reset))\(when($x.five_reset))"
-      + "\t7d \(pct($x.seven; $x.seven_reset))"
-      + (if ($acc[$n].rt_exp // null) != null and $acc[$n].rt_exp / 1000 < now then "\tLOGIN NEEDED" else "" end)'
+    | def live($v; $r): if $v == null or ($r // 0) < now then "" else ($v | floor | tostring) end;
+      def at($v; $r): if $v == null or ($r // 0) < now then "" else ($r | tostring) end;
+      [($n == $a | tostring), $n, $acc[$n].email,
+       live($x.five; $x.five_reset), at($x.five; $x.five_reset),
+       live($x.seven; $x.seven_reset), at($x.seven; $x.seven_reset),
+       ((($acc[$n].rt_exp // null) != null and $acc[$n].rt_exp / 1000 < now) | tostring)]
+    | join("|")')
+  printf '\n%sswitches automatically at %s%% of either window%s\n' "$DIM" "$THRESHOLD" "$RESET"
+}
+
+cmd_threshold() {
+  local n=${1:-}
+  if [ -z "$n" ]; then echo "$THRESHOLD"; return; fi
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le 100 ] || die "threshold must be 1-100"
+  state_update '.threshold = $t' --argjson t "$n"
+  echo "switching at $n%"
 }
 
 cmd_current() { state_get '.active // empty'; }
@@ -368,6 +410,7 @@ claude-switch $VERSION - swap Claude Code subscription accounts on macOS
   login <name>   log in again to a saved account (same isolated login)
   list           show accounts and their last known usage
   current        print the active account name
+  threshold [n]  show or set the usage % that triggers a switch (default 95)
   rename <old> <new>  rename a saved account
   remove <name>  delete a saved account
   report         read status line JSON on stdin; switch when over the limit
@@ -380,6 +423,8 @@ main() {
   command -v jq >/dev/null || die "jq is required"
   [ "$(uname)" = Darwin ] || die "macOS only"
   state_init
+  # Env wins over the saved value, which wins over the default.
+  THRESHOLD="${CLAUDE_SWITCH_THRESHOLD:-$(state_get '.threshold // 95')}"
   local cmd=${1:-help}
   shift || true
   case "$cmd" in
@@ -389,6 +434,7 @@ main() {
     login) cmd_login "$@" ;;
     list | ls | status) cmd_list ;;
     current) cmd_current ;;
+    threshold) cmd_threshold "$@" ;;
     rename | mv) cmd_rename "$@" ;;
     remove | rm) cmd_remove "$@" ;;
     report) cmd_report ;;

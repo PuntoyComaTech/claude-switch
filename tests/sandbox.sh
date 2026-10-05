@@ -125,6 +125,11 @@ ok "rename drops old login" "$([ -f "$KCDIR/claude-switch__b" ] && echo yes || e
 "$BIN" rename a main >/dev/null
 ok "rename moves active" "$("$BIN" current)" main
 ok "rename keeps order" "$(jq -c .order "$HOME/.claude-switch/state.json")" '["main","work","extra"]'
+"$BIN" threshold 50 >/dev/null
+ok "threshold is saved" "$("$BIN" threshold)" 50
+ok "env overrides saved threshold" "$(CLAUDE_SWITCH_THRESHOLD=70 "$BIN" threshold)" 70
+"$BIN" threshold 0 >/dev/null 2>&1
+ok "threshold rejects 0" "$("$BIN" threshold)" 50
 "$BIN" list >"$S/list" 2>&1
 ok "list renders" "$?" 0
 cat "$S/list"

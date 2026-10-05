@@ -3,8 +3,11 @@
 Use several Claude subscriptions (Pro / Max) in Claude Code on macOS. When one reaches its usage limit, every session moves to the next one on its own, without logging in again and without restarting.
 
 ```
-* trabajo    me@company.com    5h 96%  resets Mon 18:00   7d 40%
-  personal   me@gmail.com      5h 12%                     7d 8%
+  ACCOUNT      EMAIL                SESSION (5h)                       WEEKLY (7d)
+● trabajo      me@company.com       ███░░░░░░░  32%  resets in 4h 5m   █████████░  90%  resets in 1d 5h
+  personal     me@gmail.com         █░░░░░░░░░  12%  resets in 2h 40m  █░░░░░░░░░   8%  resets in 5d 2h
+
+switches automatically at 96% of either window
 ```
 
 - **Automatic.** Claude Code already sends your 5-hour and weekly usage to the status line. claude-switch reads it there and switches at 95%.
@@ -57,19 +60,16 @@ That is all. Use Claude Code as usual. When the active account reaches the thres
 | `claude-switch rename <old> <new>` | Rename an account |
 | `claude-switch remove <name>` | Forget an account |
 | `claude-switch current` | Print the active account name |
+| `claude-switch threshold [n]` | Show or set the switch threshold |
 
 ### Settings
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `CLAUDE_SWITCH_THRESHOLD` | `95` | Usage % (5h or weekly) that triggers a switch |
-| `CLAUDE_SWITCH_DIR` | `~/.claude-switch` | State, log and installed status line |
-
-The threshold is read where `report` runs, so set it in your status line script:
-
 ```sh
-printf '%s' "$input" | CLAUDE_SWITCH_THRESHOLD=96 claude-switch report
+claude-switch threshold 96    # switch at 96% of the 5h or weekly window (default 95)
+claude-switch threshold       # show the current value
 ```
+
+`CLAUDE_SWITCH_THRESHOLD` overrides the saved value for one command. `CLAUDE_SWITCH_DIR` moves the state folder (default `~/.claude-switch`).
 
 Logs: `~/.claude-switch/log`.
 
