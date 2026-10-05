@@ -81,7 +81,9 @@ Add this line after your script reads stdin into `$input`:
 command -v claude-switch >/dev/null && { printf '%s' "$input" | claude-switch report >/dev/null 2>&1 & }
 ```
 
-To show the active account, add `$(claude-switch current)` to your output. [statusline-example.sh](statusline-example.sh) is a complete example.
+To show the active account, add `$(claude-switch current)` to your output.
+
+Also set `"refreshInterval": 120` on `statusLine` in `~/.claude/settings.json`. The status line otherwise only runs on session events, which go quiet while a session waits on background agents. It reruns your local script only: no requests, no tokens. [statusline-example.sh](statusline-example.sh) is a complete example.
 
 ## How it works
 

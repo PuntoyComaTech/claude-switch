@@ -61,7 +61,7 @@ setup_statusline() {
     get statusline-example.sh "$STATUSLINE"
     cp "$SETTINGS" "$SETTINGS.bak.claude-switch"
     tmp=$(mktemp)
-    jq --arg c "bash $STATUSLINE" '.statusLine = {type: "command", command: $c}' "$SETTINGS" >"$tmp" \
+    jq --arg c "bash $STATUSLINE" '.statusLine = {type: "command", command: $c, refreshInterval: 120}' "$SETTINGS" >"$tmp" \
       && mv "$tmp" "$SETTINGS"
     say "status line: installed (backup at $SETTINGS.bak.claude-switch)"
     return
