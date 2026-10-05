@@ -29,11 +29,12 @@ cd claude-switch
 Save each account once:
 
 ```sh
-claude-switch add personal     # the account you are logged in with now
-claude auth login              # log in with the other account in the browser
-claude-switch add work
+claude-switch add personal          # the account you are logged in with now
+claude-switch add work --login      # log in to another one in the browser
 claude-switch list
 ```
+
+`add --login` runs `claude auth login` inside a throwaway config dir. Claude Code keeps a separate Keychain item per config dir, so your current login and every running session stay on the account they are using. The new account is just added to the list. If a Claude Code version ever writes the main item anyway, claude-switch puts the original back.
 
 The first Keychain access may show a macOS prompt for `security`. Choose **Always Allow**.
 
@@ -58,9 +59,10 @@ No status line yet? See [statusline-example.sh](statusline-example.sh) and add t
 | Command | What it does |
 |---|---|
 | `add <name>` | Save the account you are logged in with |
+| `add <name> --login` | Log in to another account and save it, without switching |
 | `use <name>` | Switch to a saved account |
 | `next` | Switch to the next account that is not at its limit |
-| `login <name>` | Log in again to a saved account and save it |
+| `login <name>` | Log in again to a saved account, without switching |
 | `list` | Accounts, last known usage, and which need a login |
 | `current` | Print the active account |
 | `rename <old> <new>` | Rename a saved account |

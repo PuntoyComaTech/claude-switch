@@ -74,13 +74,9 @@ unlock() { rmdir "$LOCK" 2>/dev/null || true; trap - EXIT; }
 
 live_email() { jq -r '.oauthAccount.emailAddress // empty' "$CLAUDE_JSON" 2>/dev/null; }
 
-# Copy the live login and oauthAccount into the saved profile <name>.
-snapshot() {
-  local name=$1 live acct email profile rt_exp
-  live=$(kc_read "$CC_SERVICE" "$KC_ACCOUNT") || die "no Claude Code login found in the Keychain"
-  acct=$(jq -c '.oauthAccount // null' "$CLAUDE_JSON")
-  [ "$acct" != null ] || die "no oauthAccount in $CLAUDE_JSON; run 'claude' once after logging in"
-  email=$(jq -r '.emailAddress' <<<"$acct")
+# Store a login (Keychain JSON) and its oauthAccount as profile <name>.
+save_profile() {
+  local name=$1 live=$2 acct=$3 email=$4 profile rt_exp
   # Secrets go through stdin, never argv.
   profile=$(printf '%s' "$live" | jq -c --argjson acct "$acct" --argjson keys "$LOGIN_KEYS" \
     '{login: with_entries(select(.key as $k | $keys | index($k))), oauthAccount: $acct}')
@@ -90,16 +86,82 @@ snapshot() {
     --arg n "$name" --arg e "$email" --argjson r "$rt_exp"
 }
 
-# Save the active account's live login, since Claude Code rotates its tokens.
+# Copy the live login into profile <name>.
+snapshot() {
+  local name=$1 live acct email
+  live=$(kc_read "$CC_SERVICE" "$KC_ACCOUNT") || die "no Claude Code login found in the Keychain"
+  acct=$(jq -c '.oauthAccount // null' "$CLAUDE_JSON")
+  email=$(jq -r '.emailAddress // empty' <<<"$acct")
+  [ -n "$email" ] || email=$(state_get --arg n "$name" '.accounts[$n].email // empty')
+  [ -n "$email" ] || die "no oauthAccount in $CLAUDE_JSON; run 'claude' once after logging in"
+  save_profile "$name" "$live" "$acct" "$email"
+}
+
+account_for_email() {
+  state_get --arg e "$1" '[.accounts | to_entries[] | select(.value.email == $e) | .key][0] // empty'
+}
+
+# Save the live login before replacing it, since Claude Code rotates its tokens.
 snapshot_active() {
-  local active expected live
-  active=$(state_get '.active // empty')
-  [ -n "$active" ] || return 0
-  expected=$(state_get --arg n "$active" '.accounts[$n].email')
+  local live name
   live=$(live_email)
-  [ "$live" = "$expected" ] \
-    || die "live login is '$live' but '$active' is '$expected'. Save it first: claude-switch add <name>"
-  snapshot "$active"
+  if [ -n "$live" ]; then
+    name=$(account_for_email "$live")
+    [ -n "$name" ] || die "you are logged in as '$live', which is not saved. Save it first: claude-switch add <name>"
+  else
+    name=$(state_get '.active // empty')
+    [ -n "$name" ] || return 0
+  fi
+  snapshot "$name"
+}
+
+kc_services() {
+  security dump-keychain 2>/dev/null \
+    | sed -n 's/.*"svce"<blob>="\(Claude Code-credentials-[^"]*\)".*/\1/p' | sort -u
+}
+
+# Log in inside a throwaway config dir and save the result as <name>.
+# Claude Code keys its Keychain item by config dir, so the live login and every
+# running session stay untouched.
+isolated_login() {
+  local name=$1 expected=${2:-} tmp before svc live="" acct email other main_before stray
+  tmp=$(mktemp -d "$DIR/login.XXXXXX")
+  before=$(kc_services)
+  main_before=$(kc_read "$CC_SERVICE" "$KC_ACCOUNT" || true)
+  if [ -n "$expected" ]; then
+    CLAUDE_CONFIG_DIR="$tmp" claude auth login --email "$expected" || { rm -rf "$tmp"; die "login failed"; }
+  else
+    CLAUDE_CONFIG_DIR="$tmp" claude auth login || { rm -rf "$tmp"; die "login failed"; }
+  fi
+  sleep 1
+  # Safety net: if this Claude Code version wrote the main item anyway, put it back.
+  stray=$(kc_read "$CC_SERVICE" "$KC_ACCOUNT" || true)
+  if [ -n "$main_before" ] && [ "$stray" != "$main_before" ]; then
+    live=$stray
+    kc_write "$CC_SERVICE" "$KC_ACCOUNT" "$main_before"
+    echo "claude-switch: login touched the main Keychain item; restored it" >&2
+    log "isolated login touched main item; restored"
+  fi
+  svc=$(comm -13 <(printf '%s\n' "$before") <(kc_services) | head -1)
+  if [ -n "$svc" ]; then
+    live=$(security find-generic-password -s "$svc" -w 2>/dev/null) || live=""
+  elif [ -f "$tmp/.credentials.json" ]; then
+    live=$(cat "$tmp/.credentials.json")
+  fi
+  acct=$(jq -c '.oauthAccount // null' "$tmp/.claude.json" 2>/dev/null || echo null)
+  email=$(jq -r '.emailAddress // empty' <<<"$acct")
+  [ -n "$email" ] || email=$(CLAUDE_CONFIG_DIR="$tmp" claude auth status --json 2>/dev/null | jq -r '.email // empty')
+  [ -z "$svc" ] || security delete-generic-password -s "$svc" >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+  [ -n "$live" ] || die "login did not produce credentials"
+  [ -n "$email" ] || die "could not tell which account logged in"
+  [ -z "$expected" ] || [ "$email" = "$expected" ] || die "logged in as '$email', expected '$expected'"
+  other=$(account_for_email "$email")
+  [ -z "$other" ] || [ "$other" = "$name" ] || die "'$email' is already saved as '$other'"
+  lock
+  save_profile "$name" "$live" "$acct" "$email"
+  unlock
+  echo "saved '$name' ($email)"
 }
 
 # Put saved profile <name> into Claude Code's Keychain item and ~/.claude.json.
@@ -115,7 +177,9 @@ restore() {
   kc_write "$CC_SERVICE" "$KC_ACCOUNT" "$merged"
   for try in 1 2 3; do
     tmp=$(mktemp "$HOME/.claude.json.XXXXXX")
-    if jq --argjson a "$acct" '.oauthAccount = $a' "$CLAUDE_JSON" >"$tmp" 2>/dev/null; then
+    # A null oauthAccount is dropped; Claude Code derives it from the token.
+    if jq --argjson a "$acct" 'if $a == null then del(.oauthAccount) else .oauthAccount = $a end' \
+      "$CLAUDE_JSON" >"$tmp" 2>/dev/null; then
       mv "$tmp" "$CLAUDE_JSON"
       break
     fi
@@ -146,10 +210,16 @@ require_account() {
 # --- commands ---------------------------------------------------------------
 
 cmd_add() {
-  local name=${1:-} live existing
-  [ -n "$name" ] || die "usage: claude-switch add <name>"
-  live=$(live_email)
+  local name=${1:-} flag=${2:-} live existing
+  [ -n "$name" ] || die "usage: claude-switch add <name> [--login]"
   existing=$(state_get --arg n "$name" '.accounts[$n].email // empty')
+  if [ "$flag" = --login ]; then
+    [ -z "$existing" ] || die "'$name' already exists ($existing)"
+    isolated_login "$name"
+    return
+  fi
+  live=$(live_email)
+  [ -n "$live" ] || die "no oauthAccount in $CLAUDE_JSON; run 'claude' once after logging in"
   [ -z "$existing" ] || [ "$existing" = "$live" ] \
     || die "'$name' is '$existing' but you are logged in as '$live'"
   lock
@@ -170,7 +240,6 @@ cmd_use() {
     fi
     echo "'$name' refresh token expired, logging in again"
     cmd_login "$name"
-    return
   fi
   lock
   snapshot_active
@@ -198,21 +267,17 @@ cmd_next() {
 }
 
 cmd_login() {
-  local name=${1:-} email live
+  local name=${1:-} email
   [ -n "$name" ] || die "usage: claude-switch login <name>"
-  email=$(state_get --arg n "$name" '.accounts[$n].email // empty')
-  lock
-  snapshot_active
-  unlock
-  if [ -n "$email" ]; then claude auth login --email "$email"; else claude auth login; fi
-  sleep 1
-  live=$(live_email)
-  [ -z "$email" ] || [ "$live" = "$email" ] \
-    || die "logged in as '$live', expected '$email'. Run 'claude-switch add <name>' to keep it"
-  lock
-  snapshot "$name"
-  state_update '.active = $n | .last_switch = now' --arg n "$name"
-  echo "logged in and saved '$name' ($live)"
+  require_account "$name"
+  email=$(state_get --arg n "$name" '.accounts[$n].email')
+  isolated_login "$name" "$email"
+  # Refresh the live login too when this is the account in use.
+  if [ "$(live_email)" = "$email" ]; then
+    lock
+    restore "$name"
+    unlock
+  fi
 }
 
 # Called from the status line with its JSON on stdin.
@@ -296,9 +361,11 @@ usage() {
 claude-switch $VERSION - swap Claude Code subscription accounts on macOS
 
   add <name>     save the account you are logged in with
+  add <name> --login  log in to another account in the browser and save it,
+                 without switching or touching running sessions
   use <name>     switch to a saved account (logs in again if its token expired)
   next           switch to the next account that is not at its limit
-  login <name>   log in again to a saved account and save it
+  login <name>   log in again to a saved account (same isolated login)
   list           show accounts and their last known usage
   current        print the active account name
   rename <old> <new>  rename a saved account

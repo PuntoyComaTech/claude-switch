@@ -19,15 +19,29 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-f="$KCDIR/$(printf '%s__%s' "$s" "$a" | tr ' /' '__')"
+key=$(printf '%s' "$s" | tr ' /' '__')
+if [ -n "$a" ]; then f="$KCDIR/${key}__$a"; else f=$(ls "$KCDIR/${key}__"* 2>/dev/null | grep -v '\.svc$' | head -1); fi
 case $cmd in
-  find-generic-password) [ -f "$f" ] || exit 44; cat "$f" ;;
-  add-generic-password) printf '%s' "$w" >"$f" ;;
-  delete-generic-password) rm -f "$f" ;;
+  find-generic-password) [ -n "$f" ] && [ -f "$f" ] || exit 44; cat "$f" ;;
+  add-generic-password) printf '%s' "$w" >"$f"; printf '%s' "$s" >"$f.svc" ;;
+  delete-generic-password) rm -f "$f" "$f.svc" ;;
+  dump-keychain) for x in "$KCDIR"/*.svc; do [ -f "$x" ] && printf '    "svce"<blob>="%s"\n' "$(cat "$x")"; done ;;
 esac
 EOF
 printf '#!/bin/sh\necho "$*" >>"$KCDIR/notify"\n' >"$S/stub/osascript"
-printf '#!/bin/sh\nprintf "%%s" "$*" >"$KCDIR/login-args"\n' >"$S/stub/claude"
+# Fake browser login: logs in as $PICK. With CLAUDE_CONFIG_DIR it writes to a
+# per-dir Keychain item, like Claude Code does.
+cat >"$S/stub/claude" <<'EOF'
+#!/usr/bin/env bash
+printf '%s' "$*" >"$KCDIR/login-args"
+[ "$1 $2" = "auth login" ] || exit 0
+[ -n "${CLAUDE_CONFIG_DIR:-}" ] || { echo "stub: login without CLAUDE_CONFIG_DIR" >&2; exit 1; }
+svc="Claude Code-credentials-$(basename "$CLAUDE_CONFIG_DIR")"
+[ -n "${STRAY:-}" ] && svc="Claude Code-credentials" # simulate a version that ignores the config dir
+security add-generic-password -U -s "$svc" -a "$USER" \
+  -w "{\"claudeAiOauth\":{\"accessToken\":\"new-$PICK\",\"refreshTokenExpiresAt\":9999999999999}}"
+jq -n --arg e "$PICK" '{oauthAccount:{emailAddress:$e}}' >"$CLAUDE_CONFIG_DIR/.claude.json"
+EOF
 chmod +x "$S/stub/"*
 
 export KCDIR="$S/kc" HOME="$S/home" PATH="$S/stub:$PATH" USER=tester
@@ -83,13 +97,34 @@ jq '.accounts.a.rt_exp = 1000 | .usage = {}' "$HOME/.claude-switch/state.json" >
 "$BIN" next auto >/dev/null 2>&1
 ok "auto skips dead account" "$("$BIN" current)" b
 ok "auto notifies dead account" "$(grep -c 'claude-switch login a' "$KCDIR/notify")" 1
-"$BIN" use a >/dev/null 2>&1
-ok "manual use of dead account starts login with email" "$(cat "$KCDIR/login-args")" "auth login --email a@x"
+PICK=a@x "$BIN" use a >/dev/null
+ok "manual use of dead account logs in with its email" "$(cat "$KCDIR/login-args")" "auth login --email a@x"
+ok "re-login saved fresh token" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__a")" new-a@x
+ok "re-login then switches" "$(live_token)" new-a@x
+ok "dead flag cleared" "$("$BIN" list | grep -c 'LOGIN NEEDED')" 0
+ok "temp login item removed" "$(ls "$KCDIR" | grep -c 'credentials-login')" 0
+
+before=$(live_token)
+PICK=c@x "$BIN" add extra --login >/dev/null
+ok "add --login saves the new account" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__extra")" new-c@x
+ok "add --login keeps live login" "$(live_token)" "$before"
+ok "add --login keeps active" "$("$BIN" current)" a
+PICK=c@x "$BIN" add dup --login >/dev/null 2>&1
+ok "add --login refuses duplicate email" "$(jq -r '.accounts.dup // "none"' "$HOME/.claude-switch/state.json")" none
+PICK=z@x "$BIN" login extra >/dev/null 2>&1
+ok "login refuses wrong account" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__extra")" new-c@x
+before=$(live_token)
+STRAY=1 PICK=d@x "$BIN" add stray --login >/dev/null 2>&1
+ok "stray login restores live login" "$(live_token)" "$before"
+ok "stray login still saves new account" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__stray")" new-d@x
+"$BIN" remove stray >/dev/null
 "$BIN" rename b work >/dev/null
-ok "rename moves active" "$("$BIN" current)" work
+ok "rename leaves active alone" "$("$BIN" current)" a
 ok "rename moves saved login" "$(jq -r .login.claudeAiOauth.accessToken "$KCDIR/claude-switch__work")" tokB2
 ok "rename drops old login" "$([ -f "$KCDIR/claude-switch__b" ] && echo yes || echo no)" no
-ok "rename keeps order" "$(jq -c .order "$HOME/.claude-switch/state.json")" '["a","work"]'
+"$BIN" rename a main >/dev/null
+ok "rename moves active" "$("$BIN" current)" main
+ok "rename keeps order" "$(jq -c .order "$HOME/.claude-switch/state.json")" '["main","work","extra"]'
 "$BIN" list >"$S/list" 2>&1
 ok "list renders" "$?" 0
 cat "$S/list"
