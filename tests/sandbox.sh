@@ -40,6 +40,9 @@ if [ "$1 $2" = "auth status" ]; then
   [ -f "$KCDIR/status-email" ] || { echo '{"loggedIn":false}'; exit 0; }
   [ -f "$KCDIR/no-refresh" ] || security add-generic-password -U -s "$svc" -a "$USER" \
     -w "$(jq -c '.claudeAiOauth.accessToken |= "ref-" + . | .claudeAiOauth.expiresAt = 9999999999999' <<<"$cur")"
+  # Like Claude Code: the email comes from .claude.json, null when it is missing.
+  [ -n "$(jq -r '.oauthAccount.emailAddress // empty' "$CLAUDE_CONFIG_DIR/.claude.json" 2>/dev/null)" ] \
+    || { echo '{"loggedIn":true,"email":null}'; exit 0; }
   echo "{\"loggedIn\":true,\"email\":\"$(cat "$KCDIR/status-email")\"}"
   exit 0
 fi

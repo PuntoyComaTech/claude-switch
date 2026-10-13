@@ -246,6 +246,9 @@ refresh_via_claude() {
   cfg=$(mktemp -d "$DIR/refresh.XXXXXX")
   svc=$(cc_service_for "$cfg")
   kc_write "$svc" "$KC_ACCOUNT" "$(printf '%s' "$profile" | jq -c '.login')"
+  # Claude Code reads the email from .claude.json, not from the token; without
+  # it `auth status` reports email: null and the check below always fails.
+  printf '%s' "$profile" | jq -c '{oauthAccount: .oauthAccount}' >"$cfg/.claude.json"
   status=$(CLAUDE_CONFIG_DIR="$cfg" claude auth status --json 2>/dev/null || true)
   fresh=$(kc_read "$svc" "$KC_ACCOUNT" || true)
   if [ "$(jq -r '.email // empty' <<<"$status" 2>/dev/null)" != "$email" ]; then
