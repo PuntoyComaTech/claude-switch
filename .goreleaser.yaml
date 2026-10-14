@@ -1,0 +1,36 @@
+# Release config: run by .github/workflows/release.yml on every v* tag.
+# Local dry run: goreleaser release --snapshot --clean
+version: 2
+
+project_name: claude-switch
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/claude-switch
+    binary: claude-switch
+    env: [CGO_ENABLED=0]
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+
+archives:
+  # Stable names (no version) so install scripts can use releases/latest/download.
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:", "^ci:"]

@@ -1,102 +1,107 @@
-#!/usr/bin/env bash
-# Install claude-switch and hook it into the Claude Code status line.
+#!/bin/sh
+# Install claude-switch on macOS or Linux and hook it into the Claude Code status line.
 #
-#   curl -fsSL https://raw.githubusercontent.com/PuntoyComaTech/claude-switch/main/install.sh | bash
-#   ./install.sh                  from a clone (symlinks, so `git pull` updates it)
-#   ./install.sh --no-statusline  skip the status line step
-#   ./install.sh --uninstall      remove the command, saved logins and state
-set -euo pipefail
+#   curl -fsSL https://raw.githubusercontent.com/PuntoyComaTech/claude-switch/main/install.sh | sh
+#
+# Options (after `sh -s --` when piped):
+#   --no-setup     do not touch the Claude Code status line
+#   --uninstall    remove the binary (saved accounts stay; see README)
+# Env:
+#   CLAUDE_SWITCH_BIN_DIR   install dir (default ~/.local/bin)
+#   CLAUDE_SWITCH_VERSION   release tag to install (default: latest)
+#   CLAUDE_SWITCH_BASE_URL  where release files live (for mirrors and tests)
+set -eu
 
-RAW="https://raw.githubusercontent.com/PuntoyComaTech/claude-switch/main"
+REPO="PuntoyComaTech/claude-switch"
 BIN_DIR="${CLAUDE_SWITCH_BIN_DIR:-$HOME/.local/bin}"
-DIR="${CLAUDE_SWITCH_DIR:-$HOME/.claude-switch}"
-SETTINGS="$HOME/.claude/settings.json"
-STATUSLINE="$DIR/statusline.sh"
+VERSION="${CLAUDE_SWITCH_VERSION:-latest}"
 
 say() { printf '%s\n' "$*"; }
-die() { printf 'install: %s\n' "$*" >&2; exit 1; }
+die() {
+  printf 'install: %s\n' "$*" >&2
+  exit 1
+}
 
-# A clone has bin/claude-switch next to this script. Under `curl | bash` it does not.
-here=""
-src="${BASH_SOURCE[0]:-}"
-if [ -n "$src" ] && [ -f "$src" ]; then
-  here=$(cd "$(dirname "$src")" && pwd)
-  [ -f "$here/bin/claude-switch" ] || here=""
-fi
-
-# get <repo path> <dest>: symlink from a clone, download otherwise.
-get() {
-  if [ -n "$here" ]; then
-    ln -sf "$here/$1" "$2"
+base_url() {
+  if [ -n "${CLAUDE_SWITCH_BASE_URL:-}" ]; then
+    printf '%s' "$CLAUDE_SWITCH_BASE_URL"
+  elif [ "$VERSION" = latest ]; then
+    printf 'https://github.com/%s/releases/latest/download' "$REPO"
   else
-    curl -fsSL "$RAW/$1" -o "$2.tmp" && mv "$2.tmp" "$2"
+    printf 'https://github.com/%s/releases/download/%s' "$REPO" "$VERSION"
   fi
 }
 
-uninstall() {
-  local name
-  if [ -f "$DIR/state.json" ]; then
-    for name in $(jq -r '.order[]' "$DIR/state.json"); do
-      security delete-generic-password -s claude-switch -a "$name" >/dev/null 2>&1 || true
-    done
+detect() {
+  case "$(uname -s)" in
+    Darwin) os=darwin ;;
+    Linux) os=linux ;;
+    *) die "unsupported OS $(uname -s). On Windows use install.ps1" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=amd64 ;;
+    arm64 | aarch64) arch=arm64 ;;
+    *) die "unsupported CPU $(uname -m)" ;;
+  esac
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
   fi
-  if [ -f "$SETTINGS" ] && [ "$(jq -r '.statusLine.command // ""' "$SETTINGS")" = "bash $STATUSLINE" ]; then
-    tmp=$(mktemp)
-    jq 'del(.statusLine)' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS"
-    say "removed statusLine from $SETTINGS"
-  fi
+}
+
+install_bin() {
+  detect
+  archive="claude-switch_${os}_${arch}.tar.gz"
+  url=$(base_url)
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+
+  say "downloading $archive"
+  curl -fsSL "$url/$archive" -o "$tmp/$archive" || die "download failed: $url/$archive"
+  curl -fsSL "$url/checksums.txt" -o "$tmp/checksums.txt" || die "download failed: $url/checksums.txt"
+
+  want=$(awk -v f="$archive" '$2 == f { print $1 }' "$tmp/checksums.txt")
+  [ -n "$want" ] || die "$archive is not listed in checksums.txt"
+  [ "$(sha256 "$tmp/$archive")" = "$want" ] || die "checksum mismatch for $archive"
+
+  tar -xzf "$tmp/$archive" -C "$tmp" claude-switch
+  mkdir -p "$BIN_DIR"
+  # Replace through a temp name so a running claude-switch is never half-written.
+  # rm first: an older install may be a symlink into a git clone.
+  cp "$tmp/claude-switch" "$BIN_DIR/.claude-switch.new"
+  chmod 755 "$BIN_DIR/.claude-switch.new"
   rm -f "$BIN_DIR/claude-switch"
-  rm -rf "$DIR"
-  say "claude-switch removed. Your current Claude Code login was not touched."
-  say "If you added the report line to your own status line script, delete it."
-}
+  mv "$BIN_DIR/.claude-switch.new" "$BIN_DIR/claude-switch"
+  say "installed $BIN_DIR/claude-switch ($("$BIN_DIR/claude-switch" --version))"
 
-setup_statusline() {
-  local cmd file
-  mkdir -p "$(dirname "$SETTINGS")"
-  [ -f "$SETTINGS" ] || echo '{}' >"$SETTINGS"
-  cmd=$(jq -r '.statusLine.command // ""' "$SETTINGS")
-
-  if [ -z "$cmd" ]; then
-    get statusline-example.sh "$STATUSLINE"
-    cp "$SETTINGS" "$SETTINGS.bak.claude-switch"
-    tmp=$(mktemp)
-    jq --arg c "bash $STATUSLINE" '.statusLine = {type: "command", command: $c, refreshInterval: 120}' "$SETTINGS" >"$tmp" \
-      && mv "$tmp" "$SETTINGS"
-    say "status line: installed (backup at $SETTINGS.bak.claude-switch)"
-    return
-  fi
-
-  # Existing status line: only report whether it already calls claude-switch.
-  file=${cmd##* }
-  file=${file/#\~/$HOME}
-  if [[ "$cmd" == *claude-switch* ]] || { [ -f "$file" ] && grep -q 'claude-switch report' "$file"; }; then
-    say "status line: already hooked"
-    return
-  fi
-  say "status line: you already have one ($cmd)."
-  say "Add this line to it, right after it reads stdin into \$input:"
-  say ""
-  say "  command -v claude-switch >/dev/null && { printf '%s' \"\$input\" | claude-switch report >/dev/null 2>&1 & }"
-  say ""
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) say "note: add $BIN_DIR to your PATH, e.g. echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.profile" ;;
+  esac
 }
 
 main() {
-  [ "$(uname)" = Darwin ] || die "macOS only"
-  command -v jq >/dev/null || die "jq is required: brew install jq"
-  case "${1:-}" in
-    --uninstall) uninstall; return ;;
-  esac
-  command -v claude >/dev/null || say "warning: 'claude' not found on PATH"
-
-  mkdir -p "$BIN_DIR" "$DIR"
-  chmod 700 "$DIR"
-  get bin/claude-switch "$BIN_DIR/claude-switch"
-  chmod +x "$BIN_DIR/claude-switch"
-  say "installed $BIN_DIR/claude-switch ($("$BIN_DIR/claude-switch" --version))"
-  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "warning: add $BIN_DIR to your PATH" ;; esac
-
-  [ "${1:-}" = --no-statusline ] || setup_statusline
+  setup=1
+  for arg in "$@"; do
+    case "$arg" in
+      --no-setup) setup=0 ;;
+      --uninstall)
+        rm -f "$BIN_DIR/claude-switch"
+        say "removed $BIN_DIR/claude-switch. Your Claude Code login was not touched."
+        say "Saved accounts and settings stay; see README > Uninstall to delete them."
+        return
+        ;;
+      *) die "unknown option $arg" ;;
+    esac
+  done
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  install_bin
+  command -v claude >/dev/null 2>&1 || say "warning: 'claude' (Claude Code) not found on PATH"
+  [ "$setup" = 0 ] || "$BIN_DIR/claude-switch" setup
 
   say ""
   say "Next, save your accounts:"

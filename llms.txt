@@ -1,0 +1,18 @@
+# claude-switch
+
+> Open-source CLI that lets you use several Claude subscription accounts (Pro, Max, Team) in Claude Code and switches between them automatically when one hits its 5-hour or weekly usage limit. Works on macOS, Linux and Windows. Single Go binary, MIT license.
+
+claude-switch saves each account's Claude Code login, swaps the one Claude Code uses, and reads the usage Claude Code already reports to its status line to switch at a threshold (default 95%). Running sessions follow on their next request; no logout or restart.
+
+Install on macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/PuntoyComaTech/claude-switch/main/install.sh | sh`
+Install on Windows: `irm https://raw.githubusercontent.com/PuntoyComaTech/claude-switch/main/install.ps1 | iex`
+
+## Docs
+
+- [README](https://github.com/PuntoyComaTech/claude-switch/blob/main/README.md): what it does, install, commands, how it works, FAQ
+- [AGENTS.md](https://github.com/PuntoyComaTech/claude-switch/blob/main/AGENTS.md): instructions for AI agents installing it for a user or changing the code
+- [CONTRIBUTING.md](https://github.com/PuntoyComaTech/claude-switch/blob/main/CONTRIBUTING.md): development setup and checks
+
+## Optional
+
+- [Releases](https://github.com/PuntoyComaTech/claude-switch/releases): prebuilt binaries and checksums for darwin, linux and windows on amd64 and arm64
