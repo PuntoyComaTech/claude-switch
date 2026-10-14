@@ -100,10 +100,17 @@ func TestSetupStatusLine(t *testing.T) {
 	// A user's own status line is never replaced, and other keys survive.
 	script := filepath.Join(dir, "mine.sh")
 	_ = os.WriteFile(script, []byte("input=$(cat)\necho hi\n"), 0o600)
-	own := `{"model":"opus","statusLine":{"type":"command","command":"bash ` + script + `"}}`
-	_ = os.WriteFile(settings, []byte(own), 0o600)
+	// json.Marshal escapes Windows backslashes in the path.
+	ownJSON, _ := json.Marshal(map[string]any{
+		"model":      "opus",
+		"statusLine": map[string]string{"type": "command", "command": "bash " + script},
+	})
+	own := string(ownJSON)
+	_ = os.WriteFile(settings, ownJSON, 0o600)
 	out.Reset()
-	_ = setupStatusLine(&out, settings)
+	if err := setupStatusLine(&out, settings); err != nil {
+		t.Fatal(err)
+	}
 	if b, _ := os.ReadFile(settings); string(b) != own {
 		t.Errorf("user settings changed: %s", b)
 	}
@@ -114,7 +121,9 @@ func TestSetupStatusLine(t *testing.T) {
 	// Their script already calls report: recognised as hooked.
 	_ = os.WriteFile(script, []byte("input=$(cat)\nprintf '%s' \"$input\" | claude-switch report\n"), 0o600)
 	out.Reset()
-	_ = setupStatusLine(&out, settings)
+	if err := setupStatusLine(&out, settings); err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(out.String(), "already hooked") {
 		t.Errorf("got %q", out.String())
 	}

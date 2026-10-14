@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +51,8 @@ func TestWriteAccountKeepsOtherKeys(t *testing.T) {
 	if !strings.Contains(string(acct), "new@x") {
 		t.Errorf("account not written: %s", acct)
 	}
-	if fi, _ := os.Stat(l.ConfigFile); fi.Mode().Perm() != 0o640 {
+	// Windows has no Unix permission bits.
+	if fi, _ := os.Stat(l.ConfigFile); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o640 {
 		t.Errorf("mode changed to %v", fi.Mode().Perm())
 	}
 	if _, err := os.Stat(l.ConfigFile + ".lock"); !os.IsNotExist(err) {
